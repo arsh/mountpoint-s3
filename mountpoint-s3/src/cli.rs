@@ -26,7 +26,7 @@ use nix::unistd::ForkResult;
 use regex::Regex;
 
 use crate::build_info;
-use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir};
+use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir, XozDataCache};
 use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLive};
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
@@ -260,6 +260,24 @@ pub struct CliArgs {
         requires = "cache",
     )]
     pub max_cache_size: Option<u64>,
+
+    #[clap(
+        long,
+        help = "Enable caching of object content to the specified xoz bucket (same region only)",
+        help_heading = CACHING_OPTIONS_HEADER,
+        value_name = "BUCKET",
+        value_parser = parse_bucket_name,
+    )]
+    pub cache_xoz: Option<String>,
+
+    #[clap(
+        long,
+        help = "When caching to xoz, how big each cache block should be in MiB",
+        help_heading = CACHING_OPTIONS_HEADER,
+        value_name = "MiB",
+        requires = "cache_xoz"
+    )]
+    pub cache_xoz_block_size: Option<u64>,
 
     #[clap(
         long,
@@ -726,7 +744,9 @@ where
         if let Some(cache_config) = cache_config {
             let managed_cache_dir =
                 ManagedCacheDir::new_from_parent(path).context("failed to create cache directory")?;
+
             let cache = DiskDataCache::new(managed_cache_dir.as_path_buf(), cache_config);
+
             let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
             let mut fuse_session = create_filesystem(
                 client,
@@ -745,6 +765,36 @@ where
             return Ok(fuse_session);
         }
     }
+
+    if let Some(xoz_bucket_name) = args.cache_xoz {
+        // When using the same CRT client, it was hanging, see https://t.corp.amazon.com/D132039029/communication.
+        // So we create a new client for the xoz cache.
+        let new_args = CliArgs {
+            bucket_name: xoz_bucket_name.clone(),
+            storage_class: None,
+            sse: None,
+            sse_kms_key_id: None,
+            cache: None,
+            cache_xoz: None, // nothing is going to need this value anymore
+            ..args
+        };
+        let (xoz_client, _runtime, _personality) =
+            create_s3_client(&new_args).expect("could not create s3 client for xoz cache");
+        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client, new_args.cache_xoz_block_size);
+
+        let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
+        let fuse_session = create_filesystem(
+            client,
+            prefetcher,
+            &args.bucket_name,
+            &new_args.prefix.unwrap_or_default(),
+            filesystem_config,
+            fuse_config,
+            &bucket_description,
+        )?;
+
+        return Ok(fuse_session);
+    };
 
     let prefetcher = default_prefetch(runtime, prefetcher_config);
     create_filesystem(
